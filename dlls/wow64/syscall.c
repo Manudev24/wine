@@ -30,6 +30,8 @@
 #include "wine/unixlib.h"
 #include "wine/asm.h"
 #include "wow64_private.h"
+#include "wine/exception.h"
+#include <stdlib.h>
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wow);
@@ -1446,6 +1448,279 @@ __ASM_GLOBAL_FUNC( wow64_syscall_handler,
 #endif
 
 
+/* MADEIRA [wow-sc]: MADEIRA_WOW_SYSCALL_TRACE=1 logs every system call a 32-bit process makes
+ * (name, first four arguments, status), for finding the query whose answer differs from Windows
+ * (protectors' anti-debug/anti-VM probes). Off by default; the check is one load per call. */
+static const char * const madeira_syscall_names[] =
+{
+#define SYSCALL_ENTRY(id,name,args) #name,
+    ALL_SYSCALLS32
+#undef SYSCALL_ENTRY
+};
+
+static int madeira_syscall_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        WCHAR buf[4] = {0};
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"MADEIRA_WOW_SYSCALL_TRACE" );
+        UNICODE_STRING value = { 0, sizeof(buf), buf };
+        on = !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ? (buf[0] == '1' ? 1 : buf[0] == '2' ? 2 : buf[0] == '3' ? 3 : 0) : 0;
+    }
+    return on;
+}
+
+/* debugstr_wn would pull IsBadStringPtrW from kernel32, which wow64.dll does not import */
+static const char *madeira_w2a( const WCHAR *w, unsigned int len )
+{
+    char buf[200];
+    unsigned int i;
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    for (i = 0; i < len; i++) buf[i] = w[i] >= 0x20 && w[i] < 0x7f ? w[i] : '?';
+    buf[i] = 0;
+    return wine_dbg_sprintf( "\"%s\"", buf );
+}
+
+static const char *madeira_us32( ULONG us32 )
+{
+    const UNICODE_STRING32 *us = guest_ptr32( us32 );
+    if (!us || !us->Buffer) return "";
+    return madeira_w2a( guest_ptr32( us->Buffer ), us->Length / sizeof(WCHAR) );
+}
+
+static const char *madeira_oa32( ULONG oa32 )
+{
+    const OBJECT_ATTRIBUTES32 *oa = guest_ptr32( oa32 );
+    if (!oa) return "";
+    return madeira_us32( oa->ObjectName );
+}
+
+/* MADEIRA_WOW_WATCH=<hex guest address>[,<hex>...] (up to 4): 24 bytes at each, printed at the calls that
+ * could change code */
+static ULONG *madeira_watch_addrs(void)
+{
+    static ULONG addrs[5] = { 1 };
+    if (addrs[0] == 1)
+    {
+        WCHAR buf[64] = {0};
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"MADEIRA_WOW_WATCH" );
+        UNICODE_STRING value = { 0, sizeof(buf), buf };
+        unsigned int n = 0;
+        addrs[0] = 0;
+        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ))
+        {
+            char a[64]; unsigned int i, j = 0;
+            for (i = 0; i < 63 && buf[i]; i++) a[i] = (char)buf[i];
+            a[i] = 0;
+            while (n < 4 && a[j])
+            {
+                ULONG v = 0; char *end;
+                v = strtoul( a + j, &end, 16 );
+                if (end == a + j) break;
+                addrs[n++] = v;
+                j = end - a; if (a[j] == ',') j++;
+            }
+        }
+        addrs[n] = 0;
+    }
+    return addrs;
+}
+
+static void madeira_trace_watch( const char *name )
+{
+    ULONG *addrs = madeira_watch_addrs();
+    unsigned int k;
+    if (!addrs[0]) return;
+    if (strcmp( name, "NtProtectVirtualMemory" ) && strcmp( name, "NtFlushInstructionCache" ) && strcmp( name, "NtRaiseException" ) &&
+        strcmp( name, "NtContinue" ) && strcmp( name, "NtWriteVirtualMemory" ) && strcmp( name, "NtCreateFile" ) && strcmp( name, "NtMapViewOfSection" ))
+        return;
+    for (k = 0; addrs[k]; k++)
+    {
+        const BYTE *b = guest_ptr32( addrs[k] );
+        __TRY
+        {
+            ERR( "[wow-sc]   watch %08lx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 addrs[k], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+                 b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23] );
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+            ERR( "[wow-sc]   watch %08lx: unreadable\n", addrs[k] );
+        }
+        __ENDTRY
+    }
+}
+
+/* Before NtRaiseException runs: the record and context are on the 32-bit stack the handler reuses */
+static void madeira_trace_pre( UINT num, const UINT *args )
+{
+    UINT id = num & 0xfff;
+    const ULONG *rec, *ctx;
+    if ((num >> 12) & 3) return;
+    if (id >= ARRAY_SIZE(madeira_syscall_names) || strcmp( madeira_syscall_names[id], "NtRaiseException" )) return;
+    rec = guest_ptr32( args[0] ); ctx = guest_ptr32( args[1] );
+    __TRY
+    {
+        if (rec) ERR( "[wow-sc] pre NtRaiseException record code=%08lx flags=%08lx addr=%08lx nparams=%lu p0=%08lx p1=%08lx first=%u\n",
+                      rec[0], rec[1], rec[3], rec[4], rec[5], rec[6], args[2] );
+        if (ctx) ERR( "[wow-sc] pre   ctx eip=%08lx esp=%08lx eax=%08lx ecx=%08lx edx=%08lx\n", ctx[0xb8/4], ctx[0xc4/4], ctx[0xb0/4], ctx[0xac/4], ctx[0xa8/4] );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        ERR( "[wow-sc] pre NtRaiseException: record/context unreadable\n" );
+    }
+    __ENDTRY
+    madeira_trace_watch( "NtRaiseException" );
+}
+
+static void madeira_trace_syscall( UINT num, const UINT *args, NTSTATUS status )
+{
+    static LONG count, modules_dumped, procs_dumped;
+    LONG n;
+    UINT id = num & 0xfff;
+    const char *name = (num >> 12) & 3 ? "win32u" :
+                       id < ARRAY_SIZE(madeira_syscall_names) ? madeira_syscall_names[id] : "?";
+    const ULONG *out;
+
+    if (madeira_syscall_trace() == 3)   /* minimal: only exceptions, continues, code flushes and the watched bytes */
+    {
+        if ((num >> 12) & 3) return;
+        if (strcmp( name, "NtRaiseException" ) && strcmp( name, "NtContinue" ) && strcmp( name, "NtFlushInstructionCache" ) &&
+            strcmp( name, "NtCreateFile" ) && strcmp( name, "NtWriteVirtualMemory" )) return;
+    }
+    if (madeira_syscall_trace() == 2)   /* quiet: no win32u, none of the polling loop */
+    {
+        static const char * const skip[] = { "NtWaitForSingleObject", "NtWaitForMultipleObjects", "NtQueryPerformanceCounter",
+            "NtCreateTimer", "NtSetTimer", "NtClose", "NtDeviceIoControlFile", "NtReadFile", "NtDelayExecution", "NtSetEvent",
+            "NtResetEvent", "NtReleaseSemaphore", "NtYieldExecution", "NtReadVirtualMemory",
+            "NtAreMappedFilesTheSame", "NtQueryInformationFile", "NtSetInformationFile", "NtWriteFile", "NtAlertThreadByThreadId",
+            "NtWaitForAlertByThreadId", "NtQueryVirtualMemory", "NtGetNlsSectionPtr" };
+        unsigned int i;
+        if ((num >> 12) & 3) return;
+        for (i = 0; i < ARRAY_SIZE(skip); i++) if (!strcmp( name, skip[i] )) return;
+    }
+    n = InterlockedIncrement( &count );   /* printed lines only */
+    if (n > 2000000) return;
+    ERR( "[wow-sc] #%ld %04x %s(%08x %08x %08x %08x) -> %08lx\n", n, num, name,
+         args[0], args[1], args[2], args[3], (ULONG)status );
+    if ((num >> 12) & 3) return;
+    madeira_trace_watch( name );
+
+    if (!strcmp( name, "NtContinue" ) || !strcmp( name, "NtRaiseException" ))
+    {
+        /* Themida passes garbage to NtRaiseException on purpose: read under a page-fault guard */
+        const ULONG *ctx = guest_ptr32( !strcmp( name, "NtContinue" ) ? args[0] : args[1] );
+        const ULONG *rec = !strcmp( name, "NtRaiseException" ) ? guest_ptr32( args[0] ) : NULL;
+        __TRY
+        {
+            if (rec) ERR( "[wow-sc]   record code=%08lx flags=%08lx addr=%08lx nparams=%lu p0=%08lx p1=%08lx\n",
+                          rec[0], rec[1], rec[3], rec[4], rec[5], rec[6] );
+            if (ctx) ERR( "[wow-sc]   ctx flags=%08lx eip=%08lx esp=%08lx ebp=%08lx eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx efl=%08lx\n",
+                          ctx[0], ctx[0xb8/4], ctx[0xc4/4], ctx[0xb4/4], ctx[0xb0/4], ctx[0xa4/4], ctx[0xac/4], ctx[0xa8/4],
+                          ctx[0x9c/4], ctx[0x98/4 + 1], ctx[0xc0/4] );
+        }
+        __EXCEPT_PAGE_FAULT
+        {
+            ERR( "[wow-sc]   (record/context unreadable)\n" );
+        }
+        __ENDTRY
+    }
+    else if (!strcmp( name, "NtFlushInstructionCache" ))
+    {
+        const BYTE *b = guest_ptr32( args[1] );
+        ULONG len = args[2], i;
+        if (b && len <= 0x800)
+        {
+            __TRY
+            {
+                for (i = 0; i < len; i += 32)
+                {
+                    char line[3 * 32 + 1], *q = line; ULONG j;
+                    for (j = 0; j < 32 && i + j < len; j++) q += sprintf( q, "%02x ", b[i + j] );
+                    ERR( "[wow-sc]   flush %08lx: %s\n", args[1] + i, line );
+                }
+            }
+            __EXCEPT_PAGE_FAULT
+            {
+                ERR( "[wow-sc]   (flush range unreadable)\n" );
+            }
+            __ENDTRY
+        }
+    }
+
+    if (!strcmp( name, "NtAllocateVirtualMemory" ) || !strcmp( name, "NtAllocateVirtualMemoryEx" ))
+    {
+        const ULONG *base = guest_ptr32( args[1] ), *size = guest_ptr32( args[3] );
+        BOOL ex = name[23] == 'E';
+        ERR( "[wow-sc]   base=%08lx size=%08lx type=%08x prot=%08x\n", base ? base[0] : 0, size ? size[0] : 0,
+             ex ? args[4] : args[4], ex ? args[5] : args[5] );
+    }
+    else if (!strcmp( name, "NtFreeVirtualMemory" ) || !strcmp( name, "NtProtectVirtualMemory" ))
+    {
+        const ULONG *base = guest_ptr32( args[1] ), *size = guest_ptr32( args[2] ), *old = guest_ptr32( args[4] );
+        ERR( "[wow-sc]   base=%08lx size=%08lx arg=%08x old=%08lx\n", base ? base[0] : 0, size ? size[0] : 0, args[3],
+             name[2] == 'P' && old ? old[0] : 0 );
+    }
+    else if (!strcmp( name, "NtMapViewOfSection" ) || !strcmp( name, "NtMapViewOfSectionEx" ))
+    {
+        const ULONG *base = guest_ptr32( args[2] );
+        BOOL ex = name[18] == 'E';
+        const ULONG *size = guest_ptr32( ex ? args[4] : args[6] );
+        ERR( "[wow-sc]   base=%08lx size=%08lx\n", base ? base[0] : 0, size ? size[0] : 0 );
+    }
+    else if (!strcmp( name, "NtQueryVirtualMemory" ) && !status && args[2] == 0 && (out = guest_ptr32( args[3] )))
+        ERR( "[wow-sc]   mbi base=%08lx allocbase=%08lx allocprot=%08lx size=%08lx state=%08lx prot=%08lx type=%08lx\n",
+             out[0], out[1], out[2], out[3], out[4], out[5], out[6] );
+    else if (!strcmp( name, "NtCreateFile" ) || !strcmp( name, "NtOpenFile" ) || !strcmp( name, "NtOpenKey" ) ||
+        !strcmp( name, "NtOpenKeyEx" ) || !strcmp( name, "NtCreateKey" ) || !strcmp( name, "NtOpenDirectoryObject" ) ||
+        !strcmp( name, "NtOpenSection" ) || !strcmp( name, "NtOpenEvent" ) || !strcmp( name, "NtOpenMutant" ) ||
+        !strcmp( name, "NtCreateMutant" ) || !strcmp( name, "NtOpenSymbolicLinkObject" ) || !strcmp( name, "NtOpenSemaphore" ))
+        ERR( "[wow-sc]   name=%s\n", madeira_oa32( args[2] ));
+    else if (!strcmp( name, "NtQueryAttributesFile" ) || !strcmp( name, "NtQueryFullAttributesFile" ))
+        ERR( "[wow-sc]   name=%s\n", madeira_oa32( args[0] ));
+    else if (!strcmp( name, "NtQueryValueKey" ))
+        ERR( "[wow-sc]   value=%s\n", madeira_us32( args[1] ));
+    else if ((!strcmp( name, "NtQueryInformationProcess" ) || !strcmp( name, "NtQueryInformationThread" )) &&
+             !status && (out = guest_ptr32( args[2] )))
+        ERR( "[wow-sc]   class=%#x out=%08lx %08lx %08lx %08lx\n", args[1], out[0],
+             args[3] > 4 ? out[1] : 0, args[3] > 8 ? out[2] : 0, args[3] > 12 ? out[3] : 0 );
+    else if (!strcmp( name, "NtGetContextThread" ) && !status && (out = guest_ptr32( args[1] )))
+        ERR( "[wow-sc]   ctxflags=%08lx dr0=%08lx dr1=%08lx dr2=%08lx dr3=%08lx dr6=%08lx dr7=%08lx\n",
+             out[0], out[1], out[2], out[3], out[4], out[5], out[6] );
+    else if (!strcmp( name, "NtQuerySystemInformation" ) && !status && (out = guest_ptr32( args[1] )))
+    {
+        if (args[0] == 0xb && InterlockedIncrement( &modules_dumped ) <= 2)
+        {
+            /* RTL_PROCESS_MODULES: count, then 0x11c-byte entries with FullPathName at +0x1c */
+            ULONG i, count = out[0];
+            ERR( "[wow-sc]   %lu system modules\n", count );
+            for (i = 0; i < count && i < 64; i++)
+            {
+                const char *entry = (const char *)(out + 1) + i * 0x11c;
+                ERR( "[wow-sc]   module %lu base=%08lx %.200s\n", i, *(const ULONG *)(entry + 8), entry + 0x1c );
+            }
+        }
+        else if (args[0] == 5 && InterlockedIncrement( &procs_dumped ) <= 2)
+        {
+            const char *p = (const char *)out;
+            for (;;)
+            {
+                const ULONG *e = (const ULONG *)p;
+                ERR( "[wow-sc]   process pid=%lu parent=%lu name=%s\n", e[0x44 / 4], e[0x48 / 4], madeira_us32( host_ptr32( e + 0x38 / 4 )));
+                if (!e[0]) break;
+                p += e[0];
+            }
+        }
+        else if (args[0] == 0x23 || args[0] == 0x4c || args[0] == 0x95)
+        {
+            const BYTE *b = (const BYTE *)out;
+            ERR( "[wow-sc]   class=%#x bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 args[0], b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15] );
+        }
+    }
+}
+
 /**********************************************************************
  *           Wow64SystemServiceEx  (wow64.@)
  */
@@ -1460,7 +1735,9 @@ NTSTATUS WINAPI Wow64SystemServiceEx( UINT num, UINT *args )
         ERR( "unsupported syscall %04x\n", num );
         return STATUS_INVALID_SYSTEM_SERVICE;
     }
+    if (madeira_syscall_trace()) madeira_trace_pre( num, args );
     status = wow64_syscall( args, table->ServiceTable[id] );
+    if (madeira_syscall_trace()) madeira_trace_syscall( num, args, status );
     free_temp_data();
     return status;
 }
